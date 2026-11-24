@@ -29,6 +29,8 @@ class Tune:
         total_num = len(self.head_notes)
         for i in range(total_num - n):
             n_gram = self.head_notes[i:i+n]
+            # if len([ n for n in n_gram if n.dur.denominator % 3 == 0 ]) % 3 != 0:
+            #     continue
             n_str = NGramNote.notes_to_gram_id(n_gram)
             if n_str == '': continue
             if n_str in n_gram_dict:
@@ -40,7 +42,7 @@ class Tune:
     def count_head_n_grams(tunes, n):
         n_gram_dict = {}
         for tune in tunes:
-            tune_dict = tune._count_head_n_grams(n)
+            tune_dict = tune._count_head_n_grams(n, {})
             for gram_id, freq in tune_dict.items():
                 if gram_id in n_gram_dict:
                     n_gram_dict[gram_id] += freq
@@ -96,14 +98,66 @@ class NGramNote:
             notes.append(NGramNote(Fraction(dur), int(pitch)))
         return notes
 
+    # --- similarity (weighted edit distance) ---
+    # Tuning constants. connection_graph.py has a numba copy of this algorithm that
+    # reads these same values, so changing them here changes the graph too.
+    DIFF_INDEL = 0.7         # cost of inserting/deleting a note (scaled down for short notes)
+    DIFF_MAX_SHIFT = 2       # also try transposing gram2 by up to ±this many semitones
+    DIFF_OCTAVE_FACTOR = 0.3 # same pitch class in another octave costs this fraction
+
+    @staticmethod
+    def _pitch_cost(a, b):
+        """a, b: pitches relative to the gram's first note."""
+        if a == b:
+            return 0.0
+        cost = min(abs(a - b), 12) / 12
+        if (a - b) % 12 == 0:  # octave displacement: same pitch class
+            cost *= NGramNote.DIFF_OCTAVE_FACTOR
+        return cost
+
+    @staticmethod
+    def _event_cost(n1, n2, shift=0):
+        """Cost of substituting note n1 for n2 (n2's pitch transposed by `shift`)."""
+        # ratio-based: one doubling/halving = 0.25, capped at 0.5
+        rhythm = min(abs(math.log2(float(n1.dur) / float(n2.dur))) / 4, 0.5)
+        if n1.is_rest != n2.is_rest:
+            return 1.0 + rhythm
+        if n1.is_rest:
+            return rhythm
+        return NGramNote._pitch_cost(n1.pitch, n2.pitch + shift) + rhythm
+
+    @staticmethod
+    def _indel_cost(n):
+        """Inserting/deleting a note; short notes (grace/passing tones) are cheaper."""
+        return NGramNote.DIFF_INDEL * min(1.0, 0.5 + float(n.dur))
+
+    @staticmethod
+    def _edit_distance(gram1, gram2, shift=0):
+        m, k = len(gram1), len(gram2)
+        D = [[0.0] * (k + 1) for _ in range(m + 1)]
+        for i in range(1, m + 1):
+            D[i][0] = D[i-1][0] + NGramNote._indel_cost(gram1[i-1])
+        for j in range(1, k + 1):
+            D[0][j] = D[0][j-1] + NGramNote._indel_cost(gram2[j-1])
+        for i in range(1, m + 1):
+            for j in range(1, k + 1):
+                D[i][j] = min(D[i-1][j] + NGramNote._indel_cost(gram1[i-1]),
+                              D[i][j-1] + NGramNote._indel_cost(gram2[j-1]),
+                              D[i-1][j-1] + NGramNote._event_cost(gram1[i-1], gram2[j-1], shift))
+        return D[m][k]
+
     @staticmethod
     def calculate_diff(gram1, gram2):
-        diff = 0
-        for g1, g2 in zip(gram1, gram2):
-            if g1.is_rest != g2.is_rest:
-                diff += 1
-            diff += abs(g1.pitch - g2.pitch)
-        return diff
+        """Musical distance between two grams (0 = identical, larger = more different).
+
+        Weighted edit distance: notes may be substituted (cost from pitch + rhythm),
+        or inserted/deleted (so an added passing tone or a split note is cheap rather
+        than misaligning everything after it). Pitches are relative to each gram's
+        first note; trying small transpositions of gram2 means a single early interval
+        change isn't charged again at every later note. Symmetric.
+        """
+        return min(NGramNote._edit_distance(gram1, gram2, s)
+                   for s in range(-NGramNote.DIFF_MAX_SHIFT, NGramNote.DIFF_MAX_SHIFT + 1))
 
 # --- helper functions ---
 def load_tunes():
@@ -145,7 +199,24 @@ def _render_all_ngrams(sorted_grams):
     env = music21.environment.Environment()
     mscore = _find_mscore()
     env['musescoreDirectPNGPath'] = mscore
+    score = _build_ngram_score(sorted_grams)
 
+    import subprocess, tempfile
+    musicxml_fp = str(score.write('musicxml'))
+    png_fp = musicxml_fp.replace('.musicxml', '.png').replace('.xml', '.png')
+    subprocess.run([
+        mscore,
+        musicxml_fp, '-o', png_fp, '-r', '900'
+    ], capture_output=True)
+    # MuseScore may append a page number to the filename
+    if not os.path.exists(png_fp):
+        base, ext = os.path.splitext(png_fp)
+        png_fp = f'{base}-1{ext}'
+    return mpimg.imread(png_fp)
+
+
+def _build_ngram_score(sorted_grams):
+    """Build a music21 Score laying out the given (gram_id, freq) pairs, 4 measures per system."""
     # Every gram occupies the same number of 4/4 measures (K), padded with rests,
     # so grams of any length keep a uniform width.
     BAR_QL = 4
@@ -219,19 +290,7 @@ def _render_all_ngrams(sorted_grams):
     sl.scalingTenths = 40
     score.insert(0, sl)
     score.append(part)
-
-    import subprocess, tempfile
-    musicxml_fp = str(score.write('musicxml'))
-    png_fp = musicxml_fp.replace('.musicxml', '.png').replace('.xml', '.png')
-    subprocess.run([
-        mscore,
-        musicxml_fp, '-o', png_fp, '-r', '900'
-    ], capture_output=True)
-    # MuseScore may append a page number to the filename
-    if not os.path.exists(png_fp):
-        base, ext = os.path.splitext(png_fp)
-        png_fp = f'{base}-1{ext}'
-    return mpimg.imread(png_fp)
+    return score
 
 
 def _gram_label(gram_id):

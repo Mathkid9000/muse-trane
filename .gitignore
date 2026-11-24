@@ -1,3 +1,4 @@
 storage/
 env.env
 __pycache__
+analysis/.ngram_cache
