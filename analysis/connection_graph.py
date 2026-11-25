@@ -31,23 +31,13 @@ from sklearn.manifold import smacof
 from tqdm import tqdm
 
 from melodic_analysis import (OMNIBOOK_DIR, NGramNote, Tune, _build_ngram_score,
-                              _find_mscore, _gram_label)
+                              _find_mscore, _gram_label, load_tunes)
 
 CACHE_DIR = pathlib.Path(__file__).parent / '.ngram_cache'
 RENDER_DPI = 150
 
 
 # --- data ---
-def load_tunes_with_progress():
-    files = sorted(OMNIBOOK_DIR.iterdir())
-    tunes = []
-    for file in tqdm(files, desc='Loading tunes', unit='tune'):
-        tune = Tune(file.name)
-        tune.load_from_file(file)
-        tunes.append(tune)
-    return tunes
-
-
 def sorted_grams(n_gram_dict):
     return sorted(n_gram_dict.items(), key=lambda x: x[1], reverse=True)
 
@@ -171,8 +161,12 @@ def _crop_whitespace(img, pad=10):
     return out
 
 
-def render_notation(grams):
-    """Return {gram_id: cropped image}. Renders missing grams in one MuseScore batch job."""
+def render_notation(grams, key_by_freq=False):
+    """Return {gram_id: cropped image} ({(gram_id, freq): image} with key_by_freq).
+
+    Renders missing grams in one MuseScore batch job; PNGs are cached in CACHE_DIR.
+    """
+    grams = list(dict.fromkeys(grams))  # drop duplicates, keep order
     CACHE_DIR.mkdir(exist_ok=True)
 
     def key(gram_id, freq):
@@ -212,8 +206,76 @@ def render_notation(grams):
         if fp is None:
             tqdm.write(f'warning: no notation rendered for {gram_id}')
             continue
-        images[gram_id] = _crop_whitespace(mpimg.imread(fp))
+        images[(gram_id, freq) if key_by_freq else gram_id] = _crop_whitespace(mpimg.imread(fp))
     return images
+
+
+# --- hover ---
+def attach_notation_hover(fig, ax, layers, pos, priority, images, texts):
+    """Show a notation popup + text box when hovering points on `ax`.
+
+    layers:   list of (scatter_artist, idx) where point k of the scatter is item idx[k]
+    pos:      (N, 2) data coordinates of every item
+    priority: (N,) when several points are under the cursor, the highest wins
+    images:   (N,) notation image or None per item
+    texts:    (N,) text shown under the popup
+    Returns the callback id (keep the figure alive to keep it working).
+    """
+    popup = AnnotationBbox(OffsetImage(np.ones((2, 2, 3)), zoom=0.5), (0, 0),
+                           xybox=(0, 90), xycoords=ax.transData, boxcoords='offset points',
+                           pad=0.4, bboxprops=dict(edgecolor='#888', facecolor='white'),
+                           zorder=10)
+    popup.set_visible(False)
+    popup.set_annotation_clip(False)
+    fig.add_artist(popup)  # figure-level so it draws over colorbars / other axes
+    info = ax.annotate('', (0, 0), xytext=(0, -22), textcoords='offset points',
+                       ha='center', va='top', fontsize=8, fontfamily='monospace',
+                       bbox=dict(boxstyle='round', fc='white', ec='#888'), zorder=11)
+    info.set_visible(False)
+    info.set_annotation_clip(False)
+    priority = np.asarray(priority, dtype=float)
+    current = [None]
+
+    def on_move(event):
+        idx = None
+        if event.inaxes == ax:
+            cand = []
+            for artist, idx_map in layers:
+                hit, details = artist.contains(event)
+                if hit:
+                    cand.extend(np.asarray(idx_map)[details['ind']])
+            if cand:
+                cand = np.array(cand)
+                disp = ax.transData.transform(pos[cand])
+                dist = np.hypot(*(disp - [event.x, event.y]).T)
+                idx = cand[np.lexsort((dist, -priority[cand]))[0]]
+        if idx == current[0]:
+            return
+        current[0] = idx
+        if idx is None:
+            popup.set_visible(False)
+            info.set_visible(False)
+        else:
+            img = images[idx]
+            # place popup above or below depending on where the point is on screen
+            _, y_frac = ax.transAxes.inverted().transform(ax.transData.transform(pos[idx]))
+            dy = -110 if y_frac > 0.6 else 110
+            if img is not None:
+                popup.offsetbox.set_data(img)
+                popup.offsetbox.set_zoom(min(0.6, 550 / img.shape[1]))
+                popup.xy = pos[idx]
+                popup.xybox = (0, dy)
+                popup.set_visible(True)
+            else:
+                popup.set_visible(False)
+            info.xy = pos[idx]
+            info.set_text(texts[idx] + ('' if img is not None else '  (notation not rendered)'))
+            info.set_position((0, 22 if dy < 0 else -22))
+            info.set_va('bottom' if dy < 0 else 'top')
+            info.set_visible(True)
+        fig.canvas.draw_idle()
+
+    return fig.canvas.mpl_connect('motion_notify_event', on_move)
 
 
 # --- plot ---
@@ -250,57 +312,9 @@ def draw_graph(grams, D, pos, images, edges):
     cbar.ax.yaxis.set_major_formatter(ScalarFormatter())
     cbar.ax.yaxis.set_minor_formatter(ScalarFormatter())
 
-    # Hover popup: notation image + text
-    popup = AnnotationBbox(OffsetImage(np.ones((2, 2, 3)), zoom=0.5), (0, 0),
-                           xybox=(0, 90), xycoords=ax.transData, boxcoords='offset points',
-                           pad=0.4, bboxprops=dict(edgecolor='#888', facecolor='white'),
-                           zorder=10)
-    popup.set_visible(False)
-    popup.set_annotation_clip(False)
-    fig.add_artist(popup)  # figure-level so it draws over the colorbar
-    info = ax.annotate('', (0, 0), xytext=(0, -22), textcoords='offset points',
-                       ha='center', va='top', fontsize=8, fontfamily='monospace',
-                       bbox=dict(boxstyle='round', fc='white', ec='#888'), zorder=11)
-    info.set_visible(False)
-    current = [None]
-
-    def on_move(event):
-        hit, details = nodes.contains(event) if event.inaxes == ax else (False, {})
-        idx = None
-        if hit:
-            # among hit nodes, prefer the most frequent (drawn on top), then the closest
-            cand = order[details['ind']]
-            disp = ax.transData.transform(pos[cand])
-            dist = np.hypot(*(disp - [event.x, event.y]).T)
-            idx = cand[np.lexsort((dist, -freqs[cand]))[0]]
-        if idx == current[0]:
-            return
-        current[0] = idx
-        if idx is None:
-            popup.set_visible(False)
-            info.set_visible(False)
-        else:
-            gram_id, freq = grams[idx]
-            img = images.get(gram_id)
-            # place popup above or below depending on where the node is on screen
-            _, y_frac = ax.transAxes.inverted().transform(ax.transData.transform(pos[idx]))
-            dy = -110 if y_frac > 0.6 else 110
-            if img is not None:
-                popup.offsetbox.set_data(img)
-                popup.offsetbox.set_zoom(min(0.6, 550 / img.shape[1]))
-                popup.xy = pos[idx]
-                popup.xybox = (0, dy)
-                popup.set_visible(True)
-            else:
-                popup.set_visible(False)
-            info.xy = pos[idx]
-            info.set_text(f'{labels[idx]}\n×{freq}' + ('' if img is not None else '  (notation not rendered)'))
-            info.set_position((0, 22 if dy < 0 else -22))
-            info.set_va('bottom' if dy < 0 else 'top')
-            info.set_visible(True)
-        fig.canvas.draw_idle()
-
-    fig.canvas.mpl_connect('motion_notify_event', on_move)
+    fig._hover = attach_notation_hover(
+        fig, ax, [(nodes, order)], pos, freqs, [images.get(g) for g, _ in grams],
+        [f'{labels[i]}\n×{grams[i][1]}' for i in range(N)])
     pad = 0.05 * np.ptp(pos, axis=0).max()
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
     ax.set_ylim(pos[:, 1].min() - pad, pos[:, 1].max() + pad)
@@ -317,7 +331,7 @@ def main():
                         help='connect each node to its k most similar n-grams')
     args = parser.parse_args()
 
-    tunes = load_tunes_with_progress()
+    tunes = load_tunes()
     grams = sorted_grams(Tune.count_head_n_grams(tunes, args.n))
     print(f'{len(grams)} distinct {args.n}-grams')
     if len(grams) < 2:

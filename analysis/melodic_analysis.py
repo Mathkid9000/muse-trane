@@ -5,8 +5,10 @@ import matplotlib.image as mpimg
 import os
 import math
 from fractions import Fraction
+import json
 
 OMNIBOOK_DIR = pathlib.Path("./omnibook/")
+OMNIBOOK_HEAD_LENGTH_DIR = pathlib.Path("./analysis/omnibook_head_lengths.json")
 
 #--- tune class ---
 class Tune:
@@ -15,34 +17,45 @@ class Tune:
         self.head_notes = []
         self.output_notes = []
     
-    def load_from_file(self, path):
+    def load_from_file(self, path, head_length):
         score = music21.converter.parseFile(path)
         for i, n in enumerate(score.flatten().notesAndRests):
             note = NGramNote.from_music21(n)
             if note.dur <= 0: continue
-            if n.measureNumber < 16:
+            if n.measureNumber < head_length:
                 self.head_notes.append(note)
             else:
                 self.output_notes.append(note)
-    
-    def _count_head_n_grams(self, n, n_gram_dict):
-        total_num = len(self.head_notes)
+
+    @staticmethod
+    def count_n_grams(notes, n):
+        n_gram_dict = {}
+        total_num = len(notes)
         for i in range(total_num - n):
-            n_gram = self.head_notes[i:i+n]
-            # if len([ n for n in n_gram if n.dur.denominator % 3 == 0 ]) % 3 != 0:
-            #     continue
+            n_gram = notes[i:i+n]
             n_str = NGramNote.notes_to_gram_id(n_gram)
             if n_str == '': continue
             if n_str in n_gram_dict:
                 n_gram_dict[n_str] += 1
             else: n_gram_dict[n_str] = 1
         return n_gram_dict
-    
+        
     @staticmethod
     def count_head_n_grams(tunes, n):
         n_gram_dict = {}
         for tune in tunes:
-            tune_dict = tune._count_head_n_grams(n, {})
+            tune_dict = Tune.count_n_grams(tune.head_notes, n)
+            for gram_id, freq in tune_dict.items():
+                if gram_id in n_gram_dict:
+                    n_gram_dict[gram_id] += freq
+                else:
+                    n_gram_dict[gram_id] = freq
+        return n_gram_dict
+    @staticmethod
+    def count_output_n_grams(tunes, n):
+        n_gram_dict = {}
+        for tune in tunes:
+            tune_dict = Tune.count_n_grams(tune.output_notes, n)
             for gram_id, freq in tune_dict.items():
                 if gram_id in n_gram_dict:
                     n_gram_dict[gram_id] += freq
@@ -98,76 +111,123 @@ class NGramNote:
             notes.append(NGramNote(Fraction(dur), int(pitch)))
         return notes
 
-    # --- similarity (weighted edit distance) ---
-    # Tuning constants. connection_graph.py has a numba copy of this algorithm that
-    # reads these same values, so changing them here changes the graph too.
+    # --- legacy distance constants ---
+    # Used only by the numba edit-distance kernel in connection_graph.py /
+    # head_vs_output.py (an unbounded distance for MDS layout), not by calculate_diff.
     DIFF_INDEL = 0.7         # cost of inserting/deleting a note (scaled down for short notes)
     DIFF_MAX_SHIFT = 2       # also try transposing gram2 by up to ±this many semitones
     DIFF_OCTAVE_FACTOR = 0.3 # same pitch class in another octave costs this fraction
 
+    # --- similarity score (0..1) ---
+    # Relative weight of each component in calculate_diff (normalized to sum to 1).
+    SIM_W_RHYTHM = 0.35
+    SIM_W_INTERVAL = 0.35
+    SIM_W_NOTE = 0.30
+
     @staticmethod
-    def _pitch_cost(a, b):
-        """a, b: pitches relative to the gram's first note."""
-        if a == b:
+    def _align(a, b, sub, indel):
+        """Normalized edit distance in [0, 1]. sub(x, y) and indel(x) must be in [0, 1],
+        so the raw distance is at most max(len(a), len(b))."""
+        m, k = len(a), len(b)
+        if m == 0 and k == 0:
             return 0.0
-        cost = min(abs(a - b), 12) / 12
-        if (a - b) % 12 == 0:  # octave displacement: same pitch class
-            cost *= NGramNote.DIFF_OCTAVE_FACTOR
-        return cost
-
-    @staticmethod
-    def _event_cost(n1, n2, shift=0):
-        """Cost of substituting note n1 for n2 (n2's pitch transposed by `shift`)."""
-        # ratio-based: one doubling/halving = 0.25, capped at 0.5
-        rhythm = min(abs(math.log2(float(n1.dur) / float(n2.dur))) / 4, 0.5)
-        if n1.is_rest != n2.is_rest:
-            return 1.0 + rhythm
-        if n1.is_rest:
-            return rhythm
-        return NGramNote._pitch_cost(n1.pitch, n2.pitch + shift) + rhythm
-
-    @staticmethod
-    def _indel_cost(n):
-        """Inserting/deleting a note; short notes (grace/passing tones) are cheaper."""
-        return NGramNote.DIFF_INDEL * min(1.0, 0.5 + float(n.dur))
-
-    @staticmethod
-    def _edit_distance(gram1, gram2, shift=0):
-        m, k = len(gram1), len(gram2)
-        D = [[0.0] * (k + 1) for _ in range(m + 1)]
-        for i in range(1, m + 1):
-            D[i][0] = D[i-1][0] + NGramNote._indel_cost(gram1[i-1])
+        prev = [0.0] * (k + 1)
         for j in range(1, k + 1):
-            D[0][j] = D[0][j-1] + NGramNote._indel_cost(gram2[j-1])
+            prev[j] = prev[j-1] + indel(b[j-1])
         for i in range(1, m + 1):
+            cur = [prev[0] + indel(a[i-1])] + [0.0] * k
             for j in range(1, k + 1):
-                D[i][j] = min(D[i-1][j] + NGramNote._indel_cost(gram1[i-1]),
-                              D[i][j-1] + NGramNote._indel_cost(gram2[j-1]),
-                              D[i-1][j-1] + NGramNote._event_cost(gram1[i-1], gram2[j-1], shift))
-        return D[m][k]
+                cur[j] = min(prev[j] + indel(a[i-1]),
+                             cur[j-1] + indel(b[j-1]),
+                             prev[j-1] + sub(a[i-1], b[j-1]))
+            prev = cur
+        return min(1.0, prev[k] / max(m, k))
+
+    @staticmethod
+    def _rhythm_similarity(gram1, gram2):
+        """Durations and the note/rest pattern; pitch is ignored."""
+        def sub(n1, n2):
+            # one doubling/halving = 0.5, two or more = 1
+            cost = min(abs(math.log2(float(n1.dur) / float(n2.dur))) / 2, 1.0)
+            if n1.is_rest != n2.is_rest:
+                cost += 0.5
+            return min(cost, 1.0)
+        # short notes (grace/passing tones) are cheaper to insert/delete
+        indel = lambda n: min(1.0, 0.5 + float(n.dur))
+        return 1.0 - NGramNote._align(gram1, gram2, sub, indel)
+
+    @staticmethod
+    def _intervals(gram):
+        pitches = [n.pitch for n in gram if not n.is_rest]
+        return [b - a for a, b in zip(pitches, pitches[1:])]
+
+    @staticmethod
+    def _interval_similarity(gram1, gram2):
+        """Successive intervals between pitched notes (transposition-invariant)."""
+        def sub(a, b):
+            if a == b:
+                return 0.0
+            # any mismatch 0.3, plus size of the difference, plus 0.4 if the direction flips
+            contour = 0.0 if (a > 0) - (a < 0) == (b > 0) - (b < 0) else 0.4
+            return 0.3 + 0.3 * min(abs(a - b), 6) / 6 + contour
+        return 1.0 - NGramNote._align(NGramNote._intervals(gram1),
+                                      NGramNote._intervals(gram2), sub, lambda _: 1.0)
+
+    @staticmethod
+    def _note_similarity(gram1, gram2):
+        """Note-by-note pitch match under the best transposition of gram2.
+
+        Unlike intervals, a single wrong note costs once here rather than twice,
+        and non-adjacent pitch relationships count.
+        """
+        p1 = [n.pitch for n in gram1 if not n.is_rest]
+        p2 = [n.pitch for n in gram2 if not n.is_rest]
+        if not p1 or not p2:
+            return 1.0 if not p1 and not p2 else 0.0
+        # the best transposition lines up at least one pair of notes
+        shifts = {a - b for a in p1 for b in p2}
+        def sub(a, b):
+            if a == b:
+                return 0.0
+            if (a - b) % 12 == 0:  # same pitch class, other octave
+                return 0.2
+            return 0.5 + 0.5 * min(abs(a - b), 6) / 6
+        return 1.0 - min(NGramNote._align(p1, [p + s for p in p2], sub, lambda _: 1.0)
+                         for s in shifts)
 
     @staticmethod
     def calculate_diff(gram1, gram2):
-        """Musical distance between two grams (0 = identical, larger = more different).
+        """Similarity between two grams: 1 = identical, 0 = nothing alike.
 
-        Weighted edit distance: notes may be substituted (cost from pitch + rhythm),
-        or inserted/deleted (so an added passing tone or a split note is cheap rather
-        than misaligning everything after it). Pitches are relative to each gram's
-        first note; trying small transpositions of gram2 means a single early interval
-        change isn't charged again at every later note. Symmetric.
+        Weighted mix of rhythmic, intervallic and note-wise similarity, each an
+        alignment (edit distance) so an added/dropped note doesn't misalign
+        everything after it. Transposition-invariant and symmetric.
         """
-        return min(NGramNote._edit_distance(gram1, gram2, s)
-                   for s in range(-NGramNote.DIFF_MAX_SHIFT, NGramNote.DIFF_MAX_SHIFT + 1))
+        w_r, w_i, w_n = NGramNote.SIM_W_RHYTHM, NGramNote.SIM_W_INTERVAL, NGramNote.SIM_W_NOTE
+        score = (w_r * NGramNote._rhythm_similarity(gram1, gram2)
+                 + w_i * NGramNote._interval_similarity(gram1, gram2)
+                 + w_n * NGramNote._note_similarity(gram1, gram2)) / (w_r + w_i + w_n)
+        return max(0.0, min(1.0, score))
 
 # --- helper functions ---
 def load_tunes():
     output = []
+    head_lengths = load_head_lengths()
     for file in OMNIBOOK_DIR.iterdir():
+        name = file.name.split('/')[-1].split('.')[0].replace('_', ' ')
+        if head_lengths[name] == 0: 
+            print(f'Skipped {name}')
+            continue
         song = Tune(file.name)
-        song.load_from_file(file)
+        song.load_from_file(file, head_lengths[name])
         output.append(song)
     return output
-    
+
+def load_head_lengths():
+    with open(OMNIBOOK_HEAD_LENGTH_DIR, 'r') as f:
+        head_lengths = json.load(f)
+    return head_lengths
+
 # --- display functions ---
 def _find_mscore():
     """Locate the MuseScore executable (env var MSCORE_PATH, PATH, or common install dirs)."""
