@@ -70,10 +70,10 @@ def cached_generated(tunes=[]):
 
 
 if __name__ == "__main__":
-    generated_tunes = generate_tunes()
-    cached_generated(generated_tunes)
+    # generated_tunes = generate_tunes()
+    # cached_generated(generated_tunes)
 
-    # generated_tunes = cached_generated()
+    generated_tunes = cached_generated()
     direct, crossed = calculate_frequencies(generated_tunes)
     summarize(direct, crossed)
     plot(direct, crossed)
