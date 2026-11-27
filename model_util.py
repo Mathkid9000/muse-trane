@@ -142,11 +142,11 @@ def get_model_config(field_sizes):
     # bottleneck and never was; the win from a smaller trunk is the ~2x cheaper
     # step, which buys more passes over the data in the same T4-hours.
     return {
-        "num_layers": 4,#10,
-        "num_heads": 4,#8,
+        "num_layers": 8,#10,
+        "num_heads": 8,#8,
         "num_kv_heads": 4,
-        "hidden_dim": 128,#640,
-        "intermediate_dim": 256,#1728,   # 8/3 x hidden, rounded to a multiple of 64
+        "hidden_dim": 640,#640,
+        "intermediate_dim": 1728,#1728,   # 8/3 x hidden, rounded to a multiple of 64
         "max_seq_len": SEQ_LEN,
         "field_sizes": field_sizes,
         # field 0 is ~40 tokens now that bars are relative (M_SAME/M_NEXT/M_SKIP_k + INSTR +

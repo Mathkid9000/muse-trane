@@ -68,6 +68,10 @@ def generate_score(model, tokenizer, seed, max_events=SEQ_LEN, seq_len=SEQ_LEN,
                 continue
 
             field_logits = model.field_logits(i, h_last, prev)[0]
+            if i == 0:
+                # '' in field 0 is padding, never a real row: sampled, it would make an event row
+                # with no bar token, which resolve_bars can't place and tokens_to_score crashes on
+                field_logits[empty_ids[0]] = float('-inf')
             if i == 0 and tokens.shape[0] < min_events:
                 field_logits[eos_id] = float('-inf')    # too short to close the piece
             if i in (1, 2) and not f0_is_struct:
@@ -75,6 +79,12 @@ def generate_score(model, tokenizer, seed, max_events=SEQ_LEN, seq_len=SEQ_LEN,
             if i == 4 and f0_is_instr:
                 masked = torch.full_like(field_logits, float('-inf'))
                 masked[voice_ids] = field_logits[voice_ids]  # an INSTR row names a voice
+                field_logits = masked
+            if i in (3, 4) and not f0_is_struct:
+                # fields 3 and 4 must be the types field 2 calls for (DUR -> PITCH + VOICE, ...)
+                allowed = (tokenizer.event_f3 if i == 3 else tokenizer.event_f4)[int(prev[2])]
+                masked = torch.full_like(field_logits, float('-inf'))
+                masked[allowed] = field_logits[allowed]
                 field_logits = masked
 
             fid = sample_field(field_logits, temperature, top_k, top_p)

@@ -645,7 +645,7 @@ def label_text(labels):
     return ','.join(str(label) for label in sorted(l for l in labels if l is not None))
 
 
-def tokens_to_score(tokens, labels=None):
+def tokens_to_score(tokens, labels=None, export=True):
     """Render rows as MusicXML, returned as a string and also written to STORAGE_DIR/output.musicxml.
 
     The rows only say what sounds and when; everything conventional about how that is written --
@@ -810,8 +810,9 @@ def tokens_to_score(tokens, labels=None):
         score.insert(0, part)
 
     xml = notation.finish(score)
-    (STORAGE_DIR / 'output.musicxml').write_text(xml, encoding='utf-8')
-    return xml
+    if export:
+        (STORAGE_DIR / 'output.musicxml').write_text(xml, encoding='utf-8')
+    return xml, score
 
 # the infill model's specials, appended after the corpus tokens and never inserted, so every
 # token already in a head keeps its id and a grown vocab still decodes an existing data.npz.
@@ -865,6 +866,18 @@ class QuintupleTokenizer:
         self.struct_f0 = { idx for tok, idx in self.vocabs[0].items() if tok in ('SOG', 'SOS', 'EOS') or tok.startswith('INSTR') }
         self.instr_f0 = { idx for tok, idx in self.vocabs[0].items() if tok.startswith('INSTR') }
         self.voice_f4 = { idx for tok, idx in self.vocabs[4].items() if tok.startswith('VOICE') }
+        # an event row's field-2 type fixes the types of fields 3 and 4 (DUR -> PITCH + VOICE,
+        # DEG -> ROOT + QUAL, NUM -> DEN + '', ...); tokens_to_score parses rows by those types, so
+        # a sampled mismatch (eg. CLEF_treble + PITCH_60) would hand it a string where it needs a number
+        f3_type = { 'DUR': 'PITCH', 'DEG': 'ROOT', 'NUM': 'DEN' }
+        f4_type = { 'DUR': 'VOICE', 'CLEF': 'VOICE', 'DEG': 'QUAL' }
+        prefix = lambda tok: tok.split('_')[0] if tok else ''
+        self.event_f3, self.event_f4 = {}, {}
+        for tok, idx in self.vocabs[2].items():
+            if not tok: continue
+            t3, t4 = f3_type.get(prefix(tok), ''), f4_type.get(prefix(tok), '')
+            self.event_f3[idx] = sorted(i for t, i in self.vocabs[3].items() if prefix(t) == t3)
+            self.event_f4[idx] = sorted(i for t, i in self.vocabs[4].items() if prefix(t) == t4)
 
     def encode(self, quint_tokens):
         quint_ids = []

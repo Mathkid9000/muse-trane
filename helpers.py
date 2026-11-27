@@ -14,6 +14,6 @@ DATASET_PATH = STORAGE_DIR / 'data.npz'
 TOKEN_CACHE_DIR = STORAGE_DIR / 'tokens'   # parsed-but-not-yet-encoded token text, in shards
 
 # Params
-SEQ_LEN = 256
+SEQ_LEN = 2048
 BATCH_SIZE = 16
 VAL_SPLIT = 0.05
