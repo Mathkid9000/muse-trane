@@ -1,4 +1,8 @@
-"""Verifiable reward: the head <-> solo kernel correlation of analysis/similarity_analysis.py, for one solo.
+"""Verifiable rewards for head <-> solo similarity.
+
+Reference reproduces the exact analysis metric (used by --check and evaluate.py); DenseReference (below)
+is the training reward, a denser, offset-free contrast built from the same kernels -- see its docstring.
+The rest of this docstring describes the exact metric.
 
 The analysis centres every frequency vector by a leave-one-out corpus mean and correlates through
 F = S ** POWER over the corpus vocabulary V. With dh = A H (A = I - W, W the leave-one-out weights)
@@ -164,6 +168,144 @@ class Reference:
         return R, info
 
 
+def _freq(tunes, notes_of, n, index):
+    X = np.zeros((len(tunes), len(index)), np.float64)
+    for i, t in enumerate(tunes):
+        for g, f in Tune.count_n_grams(notes_of(t), n).items(): X[i, index[g]] = f
+    return X / np.maximum(X.sum(1, keepdims=True), 1)
+
+
+def _gram_kernel(vocab, D, power):
+    """{type: D F D^T} with F = S ** power, streamed like similarity_analysis.kernel_grams (which fixes POWER)."""
+    contour = Note.encode_grams(vocab, Note.contour_elements)
+    rhythm = Note.encode_grams(vocab, Note.rhythm_elements)
+    G = { name: np.zeros((len(D), len(D))) for name in TYPES }
+    for i0 in range(0, len(vocab), 1024):
+        i1 = min(i0 + 1024, len(vocab))
+        c = kernels.similarity_block(*contour, kernels.CONTOUR_W, i0, i1)
+        r = kernels.similarity_block(*rhythm, kernels.RHYTHM_W, i0, i1)
+        for name, comb in TYPES.items():
+            G[name] += D[:, i0:i1] @ (comb(c, r).astype(np.float64) ** power @ D.T)
+    return G
+
+
+class DenseReference:
+    """Training reward: how much more a solo resembles ITS head than the other Omnibook heads.
+
+    The exact metric (Reference) is a poor training signal: for bird-v1's solos its solo-dependent part is
+    ~0.1% of the numerator, the rest a fixed per-head offset from centring by Parker's mean solo, which GRPO
+    turns into noise. So, for training:
+
+    1. dense kernel -- shorter grams (config.REWARD_N) and a softer kernel (config.REWARD_POWER) give partial
+       credit to near-quotes. 4-grams with S^3 separate Parker's solos from other tunes' as well as the exact
+       metric does (Combination: positive for 70% of solos, t = 2.9 vs 2.6 for 6-grams S^10).
+    2. no offset -- no corpus-mean centring. With cos_k(o) = <h_k, F o> / sqrt(<h_k F h_k><o F o>), the raw
+       kernel cosine between solo o and Omnibook head k,
+            R(o, i) = cos_i(o) - mean_{k not a version of i} cos_k(o)
+       is how much more the solo resembles its own head than heads in general.
+    `python rl/reward.py --dense` prints Parker's distribution of R.
+    """
+
+    def __init__(self, tunes, n, power):
+        self.n, self.power = n, power
+        self.titles = [ t.title for t in tunes ]
+        T = len(tunes)
+        self.vocab = sorted(set(Tune.count_head_n_grams(tunes, n)) | set(Tune.count_output_n_grams(tunes, n)))
+        index = { g: i for i, g in enumerate(self.vocab) }
+        bases = np.array([ base_title(t) for t in self.titles ])
+        self.same = bases[:, None] == bases[None, :]
+        self.H = _freq(tunes, lambda t: t.head_notes, n, index)
+        O = _freq(tunes, lambda t: t.output_notes, n, index)
+        self.head_grams = [ set(Tune.count_n_grams(t.head_notes, N)) for t in tunes ]   # verbatim copy check, N = 6
+        t0 = time.time()
+        G = _gram_kernel(self.vocab, np.vstack([ self.H, O ]), power)
+        print(f'dense reference kernel ({n}-grams, S^{power}) {time.time() - t0:.1f}s')
+        self.hFh, self.parker = {}, {}
+        for name, g in G.items():
+            hFh, oFo = np.diag(g[:T, :T]), np.diag(g[T:, T:])
+            cos = g[:T, T:] / np.sqrt(np.outer(hFh, oFo))          # [k, j]: head k vs Parker solo j
+            self.hFh[name] = hFh
+            self.parker[name] = np.array([ self._contrast(cos[:, j], j) for j in range(T) ])
+        self._init_runtime()
+
+    def _contrast(self, cos, head):
+        return float(cos[head] - cos[~self.same[head]].mean())
+
+    def _init_runtime(self):
+        (self.Ec, self.mc), (self.Er, self.mr) = _encode(self.vocab)
+        self.index = { t: i for i, t in enumerate(self.titles) }
+        self._proj = {}
+        # each contrast is capped at Parker's quantile: past where Parker himself sits, more is copying
+        self.target = { name: float(np.quantile(self.parker[name], config.TARGET_QUANTILE)) for name in TYPES }
+        # spread of the full reward over Parker's solos: the scale real head-awareness differences live on
+        self.parker_reward = sum(w * np.minimum(self.parker[name], self.target[name]) for name, w in config.TYPE_WEIGHTS.items())
+        self.adv_floor = config.ADV_STD_FLOOR * float(self.parker_reward.std())
+
+    __getstate__, __setstate__ = Reference.__getstate__, Reference.__setstate__
+
+    @classmethod
+    def load(cls, n=None, power=None):
+        n, power = n or config.REWARD_N, power or config.REWARD_POWER
+        tunes = cached_tunes()
+        key = ('dense', 2, n, power, tuple(t.title for t in tunes))
+        path = common.RL_DIR / f'dense_reference_n{n}_p{power}.pkl'
+        if path.exists():
+            with open(path, 'rb') as f: cached_key, state = pickle.load(f)
+            if cached_key == key:
+                ref = cls.__new__(cls)
+                ref.__setstate__(state)
+                return ref
+        ref = cls(tunes, n, power)
+        with open(path, 'wb') as f: pickle.dump((key, ref.__getstate__()), f)
+        return ref
+
+    def _projections(self, grams):
+        new = [ g for g in grams if g not in self._proj ]
+        if not new: return
+        (Ec, mc), (Er, mr) = _encode(new)
+        c = _sim_rows(Ec, mc, self.Ec, self.mc, kernels.CONTOUR_W).astype(np.float64)
+        r = _sim_rows(Er, mr, self.Er, self.mr, kernels.RHYTHM_W).astype(np.float64)
+        proj = { name: (comb(c, r) ** self.power) @ self.H.T for name, comb in TYPES.items() }
+        for j, g in enumerate(new):
+            self._proj[g] = { name: p[j] for name, p in proj.items() }
+
+    def cosines(self, notes):
+        """{type: (T,) kernel cosine between this solo and every Omnibook head}, or None for no grams."""
+        counts = Tune.count_n_grams(notes, self.n)
+        if not counts: return None
+        grams = list(counts)
+        o = np.array([ counts[g] for g in grams ], np.float64)
+        o /= o.sum()
+        self._projections(grams)
+        (Ec, mc), (Er, mr) = _encode(grams)
+        c_uu = _sim_rows(Ec, mc, Ec, mc, kernels.CONTOUR_W).astype(np.float64)
+        r_uu = _sim_rows(Er, mr, Er, mr, kernels.RHYTHM_W).astype(np.float64)
+        out = {}
+        for name, comb in TYPES.items():
+            hFo = o @ np.stack([ self._proj[g][name] for g in grams ])
+            oFo = o @ (comb(c_uu, r_uu) ** self.power) @ o
+            out[name] = hFo / np.sqrt(self.hFh[name] * oFo)
+        return out
+
+    def score(self, notes, title):
+        head = self.index[title]
+        info = { 'notes': len(notes) }
+        cos = self.cosines(notes)
+        R = 0.0
+        for name, w in config.TYPE_WEIGHTS.items():
+            s = 0.0 if cos is None else self._contrast(cos[name], head)
+            info[f'contrast_{name}'] = s
+            R += w * min(s, self.target[name])
+        counts = Tune.count_n_grams(notes, N)
+        total = sum(counts.values())
+        copy = sum(v for g, v in counts.items() if g in self.head_grams[head]) / total if total else 0.0
+        info['copy'] = copy
+        R -= config.COPY_WEIGHT * max(0.0, copy - config.COPY_FREE)
+        R -= config.LENGTH_WEIGHT * max(0.0, 1 - len(notes) / config.MIN_SOLO_NOTES)
+        info['reward'] = R
+        return R, info
+
+
 # --- decoding rollouts (top-level so a process pool can pickle it) ---
 def decode_solo(args):
     """(ids (n,5), head_length) -> solo Notes, exactly as model_similarity builds a generated Tune; None on failure."""
@@ -184,7 +326,7 @@ def decode_solo(args):
 
 class Rewarder:
     def __init__(self, workers=config.REWARD_WORKERS):
-        self.ref = Reference.load()
+        self.ref = DenseReference.load()
         self.pool = None
         if workers > 0:
             import multiprocessing as mp
@@ -205,7 +347,18 @@ if __name__ == '__main__':
     from similarity_analysis import calculate_frequencies
     ap = argparse.ArgumentParser(description='Check the per-solo reward reproduces similarity_analysis on Omnibook solos.')
     ap.add_argument('--check', type=int, default=6, help='number of Omnibook solos to recompute')
+    ap.add_argument('--dense', action='store_true', help="report the training reward on Parker's solos instead")
     args = ap.parse_args()
+
+    if args.dense:
+        ref = DenseReference.load()
+        print(f'training reward: {ref.n}-grams, S^{ref.power}; contrast = cos(own head) - mean cos(other heads)')
+        for n in TYPES:
+            v = ref.parker[n]
+            print(f'  Parker {n:<12} mean {v.mean():+.4f}  sd {v.std():.4f}  >0 in {np.mean(v > 0):.0%}  '
+                  f't {v.mean() / v.std() * np.sqrt(len(v)):.1f}  cap {ref.target[n]:.4f}')
+        print(f'  Parker full reward sd {ref.parker_reward.std():.4f} -> advantage std floor {ref.adv_floor:.4f}')
+        raise SystemExit
 
     ref = Reference.load()
     tunes = cached_tunes()

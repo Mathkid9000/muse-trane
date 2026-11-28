@@ -1,3 +1,4 @@
 reference_cache.pkl
+dense_reference_*.pkl
 logs/
 __pycache__/

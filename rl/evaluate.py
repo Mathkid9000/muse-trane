@@ -17,7 +17,7 @@ from tune import Tune
 from model_util import load_model_only, model_paths
 from similarity_analysis import calculate_frequencies, summarize
 from rollout import Constraints, sample
-from reward import Reference
+from reward import Reference, DenseReference
 
 
 def decode_tune(ids, task, tokenizer):
@@ -62,7 +62,7 @@ def main():
     cons = Constraints(tokenizer, device)
     train, heldout = common.load_split(common.load_tasks(tokenizer))
     tasks = { 'heldout': heldout, 'train': train, 'all': train + heldout }[args.split]
-    ref = Reference.load()
+    ref, dense = Reference.load(), DenseReference.load()
     (common.RL_DIR / 'logs').mkdir(exist_ok=True)
 
     for name in args.models:
@@ -87,6 +87,12 @@ def main():
         infos = [ ref.score(t.output_notes, t.title)[1] for t in tunes ]
         for k in sorted(infos[0]):
             print(f'  {k:<22} {np.mean([ i[k] for i in infos ]):8.4f}')
+        print('-- training reward (dense contrast: own head vs other heads) --')
+        infos = [ dense.score(t.output_notes, t.title)[1] for t in tunes ]
+        for k in sorted(infos[0]):
+            print(f'  {k:<22} {np.mean([ i[k] for i in infos ]):8.4f}')
+        print(f'  (Parker: contrast_Combination {dense.parker["Combination"].mean():+.4f}, '
+              f'contrast_Rhythmic {dense.parker["Rhythmic"].mean():+.4f})')
 
 
 if __name__ == '__main__':

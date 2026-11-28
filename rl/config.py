@@ -20,16 +20,19 @@ KL_BETA = 0.05                  # k3 KL penalty to the frozen base model, per so
 CLIP_NORM = 1.0
 MAX_STEPS = 500
 
-# --- reward (see reward.py) ---
+# --- reward (see reward.DenseReference) ---
+REWARD_N = 4                    # gram length of the training reward (evaluate.py still uses the 6-gram metric)
+REWARD_POWER = 3                # kernel F = S ** power; lower = more partial credit for near-quotes
 TYPE_WEIGHTS = { 'Combination': 1.0, 'Rhythmic': 0.5 }
-TARGET_R = None                 # cap on direct r per type, eg. {'Combination': 0.3, 'Rhythmic': 0.6};
-TARGET_QUANTILE = 0.75          # None -> cap at this quantile of Parker's own direct r (beyond it is copying)
-CROSSED_WEIGHT = 1.0            # subtract mean r against *other* heads -> rewards specificity, not style drift
+TARGET_QUANTILE = 0.75          # each contrast is capped at this quantile of Parker's own (beyond it is copying)
+TARGET_R = None                 # exact-metric caps for reward.Reference (--check / evaluate.py); None -> quantile
 COPY_FREE = 0.2                 # fraction of solo 6-grams allowed to appear verbatim in the head
 COPY_WEIGHT = 2.0
 MIN_SOLO_NOTES = 150            # linear penalty below this many solo notes
 LENGTH_WEIGHT = 1.0
 FAIL_REWARD = -1.0              # rollout could not be decoded into a score
+ADV_STD_FLOOR = 0.25            # advantages divide by max(group std, this x Parker's reward sd): a group whose
+                                # rewards barely differ gets small advantages instead of unit-size ones
 REWARD_WORKERS = 0              # >0: decode rollouts to notes (music21) in a process pool
 
 # --- split / eval ---

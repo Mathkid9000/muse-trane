@@ -1,5 +1,5 @@
-"""GRPO-style RLVR: sample a group of solos per Omnibook head, reward head <-> solo kernel correlation
-(rl/reward.py), and push up the log-prob of above-group-average solos, with a KL penalty to the frozen
+"""GRPO-style RLVR: sample a group of solos per Omnibook head, reward how much more each solo resembles its
+own head than other heads (rl/reward.py DenseReference), and push up the log-prob of above-group-average solos, with a KL penalty to the frozen
 base model.
 
     python rl/train_rl.py                      # full run with rl/config.py
@@ -30,10 +30,11 @@ def rollout_group(policy, cons, task, seed, n, rewarder, args):
     return seqs, rewarder(task, seqs)
 
 
-def group_advantages(rewards):
+def group_advantages(rewards, floor):
+    """(R - mean) / max(std, floor). Dividing by the bare std turns differences of ~0.002 (pure noise for
+    bird-v1) into unit advantages; the floor (config.ADV_STD_FLOOR x Parker's reward sd) keeps them small."""
     R = np.asarray(rewards, np.float64)
-    std = R.std()
-    return (R - R.mean()) / std if std > 1e-6 else np.zeros_like(R)
+    return (R - R.mean()) / max(R.std(), floor, 1e-8)
 
 
 def policy_step(policy, ref, cons, batch, opt, args, device):
@@ -121,21 +122,31 @@ def main():
         print(f'Resumed {config.RL_MODEL} at step {state["step"]}')
 
     LOG_DIR.mkdir(exist_ok=True)
-    log = open(LOG_DIR / 'train_log.jsonl', 'a')
+    log = open(LOG_DIR / f'train_{time.strftime("%Y%m%d-%H%M%S")}.jsonl', 'a')   # one file per run
     while state['step'] < args.steps:
         t0 = time.time()
-        batch, infos = [], []
+        batch, infos, groups = [], [], {}
+        floor = rewarder.ref.adv_floor
         for idx in rng.choice(len(train), size=min(args.heads, len(train)), replace=False):
             task = train[idx]
             seed = transposer.random(task.seed, rng) if config.TRANSPOSE_SEEDS else task.seed
             seqs, scored = rollout_group(policy, cons, task, seed, args.group, rewarder, args)
-            A = group_advantages([ s[0] for s in scored ])
+            R = [ s[0] for s in scored ]
+            A = group_advantages(R, floor)
             batch += [ (seqs[g], len(seed), len(seed) + args.min_solo_rows, float(A[g])) for g in range(len(seqs)) ]
             infos += [ s[1] for s in scored ]
+            groups[task.file] = { 'mean': float(np.mean(R)), 'std': float(np.std(R)) }
         t_roll = time.time() - t0
         stats = policy_step(policy, ref, cons, batch, opt, args, device)
         state['step'] += 1
+        # the step mean depends on which heads were drawn; the within-group spread (vs the floor) is
+        # what GRPO actually learns from, so log both, plus each head's group mean to track per head
+        within = float(np.mean([ g['std'] for g in groups.values() ]))
         entry = { 'step': state['step'], **mean_info(infos), **stats,
+                  'within_group_std': within, 'adv_floor': floor,
+                  'floored_frac': float(np.mean([ g['std'] < floor for g in groups.values() ])),
+                  'adv_abs_mean': float(np.mean([ abs(b[3]) for b in batch ])),
+                  'groups': groups,
                   'rollout_s': round(t_roll, 1), 'step_s': round(time.time() - t0, 1) }
 
         if state['step'] % args.eval_every == 0 or state['step'] == args.steps:
@@ -148,9 +159,9 @@ def main():
                 (paths['dir'] / 'rl_state.json').write_text(json.dumps(state, indent=2))
         log.write(json.dumps(entry) + '\n'); log.flush()
         print(' | '.join(f'{k} {v:.4g}' if isinstance(v, float) else f'{k} {v}' for k, v in entry.items()
-                         if k in ('step', 'reward', 'direct_Combination', 'crossed_Combination', 'direct_Rhythmic',
-                                  'copy', 'notes', 'kl_per_row', 'grad_norm', 'step_s', 'eval_reward',
-                                  'eval_direct_Combination', 'eval_crossed_Combination')))
+                         if k in ('step', 'reward', 'contrast_Combination', 'contrast_Rhythmic', 'within_group_std',
+                                  'adv_abs_mean', 'copy', 'notes', 'kl_per_row', 'grad_norm', 'step_s', 'eval_reward',
+                                  'eval_contrast_Combination', 'eval_contrast_Rhythmic')))
 
 
 if __name__ == '__main__':
